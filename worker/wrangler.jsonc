@@ -1,0 +1,27 @@
+{
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "yixu-photo-atlas-api",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-02",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "vars": {
+    "FRONTEND_URL": "https://runriotcomeon.github.io/yixu-photo-atlas/"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "yixu-photo-atlas-db",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "BUCKET",
+      "bucket_name": "yixu-photo-atlas-photos"
+    }
+  ]
+}
