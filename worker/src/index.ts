@@ -14,16 +14,21 @@ type PhotoRow = {
   caption: string | null;
 };
 
+type NominatimResponse = {
+  display_name?: string;
+  address?: Partial<Record<"city" | "town" | "village" | "municipality" | "county" | "state_district" | "state" | "country", string>>;
+};
+
 const allowedTypes = new Set(["image/jpeg", "image/png", "image/webp", "image/heic", "image/heif"]);
 const maxPhotoBytes = 24 * 1024 * 1024;
 
-function corsHeaders(request: Request, env: WorkerEnv) {
+function corsHeaders(request: Request, env: WorkerEnv): Record<string, string> {
   const origin = request.headers.get("Origin");
   const allowed = new URL(env.FRONTEND_URL).origin;
   if (!origin || origin !== allowed) return {};
   return {
     "Access-Control-Allow-Origin": origin,
-    "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+    "Access-Control-Allow-Methods": "GET,POST,DELETE,OPTIONS",
     "Access-Control-Allow-Headers": "Authorization,Content-Type",
     "Access-Control-Max-Age": "86400",
     Vary: "Origin",
@@ -70,7 +75,54 @@ async function ensureSchema(env: WorkerEnv) {
     env.DB.prepare("CREATE INDEX IF NOT EXISTS photos_location_idx ON photos(latitude,longitude)"),
     env.DB.prepare("CREATE TABLE IF NOT EXISTS upload_sessions (token TEXT PRIMARY KEY, expires_at TEXT NOT NULL, created_at TEXT NOT NULL)"),
     env.DB.prepare("CREATE INDEX IF NOT EXISTS upload_sessions_expires_at_idx ON upload_sessions(expires_at)"),
+    env.DB.prepare("CREATE TABLE IF NOT EXISTS geocode_cache (cache_key TEXT PRIMARY KEY, city TEXT NOT NULL, country TEXT NOT NULL, created_at TEXT NOT NULL)"),
   ]);
+}
+
+async function hasValidUploadSession(env: WorkerEnv, token: string) {
+  if (!token) return false;
+  const session = await env.DB.prepare("SELECT token FROM upload_sessions WHERE token=? AND expires_at>?").bind(token, new Date().toISOString()).first();
+  return Boolean(session);
+}
+
+async function reverseGeocode(request: Request, env: WorkerEnv) {
+  await ensureSchema(env);
+  const payload = await request.json<{ token?: unknown; latitude?: unknown; longitude?: unknown }>();
+  const token = typeof payload.token === "string" ? payload.token : "";
+  const latitude = Number(payload.latitude);
+  const longitude = Number(payload.longitude);
+  if (!(await hasValidUploadSession(env, token))) return json(request, env, { error: "Upload link expired. Scan the refreshed code." }, 401);
+  if (!Number.isFinite(latitude) || latitude < -90 || latitude > 90 || !Number.isFinite(longitude) || longitude < -180 || longitude > 180) return json(request, env, { error: "Valid coordinates required" }, 400);
+
+  // City-level precision is enough for the atlas and avoids sending exact camera coordinates upstream.
+  const approximateLatitude = Number(latitude.toFixed(3));
+  const approximateLongitude = Number(longitude.toFixed(3));
+  const cacheKey = `${approximateLatitude.toFixed(3)},${approximateLongitude.toFixed(3)}`;
+  const cached = await env.DB.prepare("SELECT city,country FROM geocode_cache WHERE cache_key=?").bind(cacheKey).first<{ city: string; country: string }>();
+  if (cached) return json(request, env, cached);
+
+  const lookup = new URL("https://nominatim.openstreetmap.org/reverse");
+  lookup.searchParams.set("format", "jsonv2");
+  lookup.searchParams.set("addressdetails", "1");
+  lookup.searchParams.set("zoom", "10");
+  lookup.searchParams.set("lat", String(approximateLatitude));
+  lookup.searchParams.set("lon", String(approximateLongitude));
+  const response = await fetch(lookup, {
+    headers: {
+      Accept: "application/json",
+      "Accept-Language": "en",
+      Referer: env.FRONTEND_URL,
+      "User-Agent": "YixuPhotoAtlas/1.0 (+https://runriotcomeon.github.io/yixu-photo-atlas/)",
+    },
+  });
+  if (!response.ok) return json(request, env, { error: "Place lookup is temporarily unavailable" }, 503);
+  const result = await response.json<NominatimResponse>();
+  const address = result.address ?? {};
+  const city = address.city ?? address.town ?? address.village ?? address.municipality ?? address.county ?? address.state_district ?? address.state ?? result.display_name?.split(",")[0]?.trim() ?? "";
+  const country = address.country ?? "";
+  if (!city) return json(request, env, { error: "No place name was found for these coordinates" }, 404);
+  await env.DB.prepare("INSERT OR REPLACE INTO geocode_cache(cache_key,city,country,created_at) VALUES(?,?,?,?)").bind(cacheKey, city, country, new Date().toISOString()).run();
+  return json(request, env, { city, country });
 }
 
 async function listPhotos(request: Request, env: WorkerEnv) {
@@ -113,7 +165,7 @@ async function uploadPhoto(request: Request, env: WorkerEnv) {
   const objectKey = `photos/${id}/${safeName}`;
   await env.BUCKET.put(objectKey, file.stream(), { httpMetadata: { contentType: file.type } });
   try {
-    await env.DB.prepare("INSERT INTO photos(id,object_key,filename,content_type,byte_size,latitude,longitude,city,country,captured_at,uploaded_at,caption) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)").bind(id, objectKey, file.name, file.type, file.size, latitude, longitude, textField(form, "city") || "From photo GPS", textField(form, "country"), textField(form, "capturedAt") || null, now, textField(form, "caption") || null).run();
+    await env.DB.prepare("INSERT INTO photos(id,object_key,filename,content_type,byte_size,latitude,longitude,city,country,captured_at,uploaded_at,caption) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)").bind(id, objectKey, file.name, file.type, file.size, latitude, longitude, textField(form, "city") || "Unknown place", textField(form, "country"), textField(form, "capturedAt") || null, now, textField(form, "caption") || null).run();
   } catch (error) {
     await env.BUCKET.delete(objectKey);
     throw error;
@@ -135,6 +187,16 @@ async function servePhoto(request: Request, env: WorkerEnv, id: string) {
   return new Response(object.body, { headers });
 }
 
+async function deletePhoto(request: Request, env: WorkerEnv, id: string) {
+  if (!(await isAdmin(request, env))) return json(request, env, { error: "Incorrect private upload key" }, 401);
+  await ensureSchema(env);
+  const row = await env.DB.prepare("SELECT object_key FROM photos WHERE id=?").bind(id).first<{ object_key: string }>();
+  if (!row) return json(request, env, { error: "Photograph not found" }, 404);
+  await env.BUCKET.delete(row.object_key);
+  await env.DB.prepare("DELETE FROM photos WHERE id=?").bind(id).run();
+  return json(request, env, { ok: true });
+}
+
 export default {
   async fetch(request: Request, env: WorkerEnv): Promise<Response> {
     const url = new URL(request.url);
@@ -143,6 +205,8 @@ export default {
       if (request.method === "GET" && url.pathname === "/api/photos") return await listPhotos(request, env);
       if (request.method === "POST" && url.pathname === "/api/upload-session") return await createUploadSession(request, env);
       if (request.method === "POST" && url.pathname === "/api/upload") return await uploadPhoto(request, env);
+      if (request.method === "POST" && url.pathname === "/api/reverse-geocode") return await reverseGeocode(request, env);
+      if (request.method === "DELETE" && url.pathname.startsWith("/api/photos/")) return await deletePhoto(request, env, url.pathname.slice("/api/photos/".length));
       if (request.method === "GET" && url.pathname.startsWith("/api/media/")) return await servePhoto(request, env, url.pathname.slice("/api/media/".length));
       if (request.method === "GET" && url.pathname === "/health") return json(request, env, { ok: true });
       return json(request, env, { error: "Not found" }, 404);
