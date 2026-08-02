@@ -63,7 +63,18 @@ async function isAdmin(request: Request, env: WorkerEnv) {
   return secureEqual(authorization, `Bearer ${env.ADMIN_TOKEN}`);
 }
 
+async function ensureSchema(env: WorkerEnv) {
+  await env.DB.batch([
+    env.DB.prepare("CREATE TABLE IF NOT EXISTS photos (id TEXT PRIMARY KEY, object_key TEXT NOT NULL UNIQUE, filename TEXT NOT NULL, content_type TEXT NOT NULL, byte_size INTEGER NOT NULL, latitude REAL NOT NULL, longitude REAL NOT NULL, city TEXT NOT NULL DEFAULT 'Unknown place', country TEXT NOT NULL DEFAULT '', captured_at TEXT, uploaded_at TEXT NOT NULL, caption TEXT)"),
+    env.DB.prepare("CREATE INDEX IF NOT EXISTS photos_uploaded_at_idx ON photos(uploaded_at)"),
+    env.DB.prepare("CREATE INDEX IF NOT EXISTS photos_location_idx ON photos(latitude,longitude)"),
+    env.DB.prepare("CREATE TABLE IF NOT EXISTS upload_sessions (token TEXT PRIMARY KEY, expires_at TEXT NOT NULL, created_at TEXT NOT NULL)"),
+    env.DB.prepare("CREATE INDEX IF NOT EXISTS upload_sessions_expires_at_idx ON upload_sessions(expires_at)"),
+  ]);
+}
+
 async function listPhotos(request: Request, env: WorkerEnv) {
+  await ensureSchema(env);
   const result = await env.DB.prepare("SELECT id,filename,latitude,longitude,city,country,captured_at,uploaded_at,caption FROM photos ORDER BY COALESCE(captured_at,uploaded_at) DESC LIMIT 1000").all<PhotoRow>();
   const origin = new URL(request.url).origin;
   return json(request, env, { photos: result.results.map((row) => ({ id: row.id, src: `${origin}/api/media/${row.id}`, filename: row.filename, latitude: row.latitude, longitude: row.longitude, city: row.city, country: row.country, capturedAt: row.captured_at, uploadedAt: row.uploaded_at, caption: row.caption })) });
@@ -71,6 +82,7 @@ async function listPhotos(request: Request, env: WorkerEnv) {
 
 async function createUploadSession(request: Request, env: WorkerEnv) {
   if (!(await isAdmin(request, env))) return json(request, env, { error: "Incorrect private upload key" }, 401);
+  await ensureSchema(env);
   const now = new Date();
   const expires = new Date(now.getTime() + 10 * 60 * 1000);
   const token = randomToken();
@@ -92,6 +104,7 @@ async function uploadPhoto(request: Request, env: WorkerEnv) {
   if (!token || !(file instanceof File)) return json(request, env, { error: "Photo and upload link required" }, 400);
   if (!Number.isFinite(latitude) || latitude < -90 || latitude > 90 || !Number.isFinite(longitude) || longitude < -180 || longitude > 180) return json(request, env, { error: "Valid map location required" }, 400);
   if (!allowedTypes.has(file.type) || file.size > maxPhotoBytes) return json(request, env, { error: "Use a JPEG, PNG, WebP, or HEIC image under 24 MB" }, 400);
+  await ensureSchema(env);
   const now = new Date().toISOString();
   const session = await env.DB.prepare("SELECT token FROM upload_sessions WHERE token=? AND expires_at>?").bind(token, now).first();
   if (!session) return json(request, env, { error: "Upload link expired. Scan the refreshed code." }, 401);
@@ -109,6 +122,7 @@ async function uploadPhoto(request: Request, env: WorkerEnv) {
 }
 
 async function servePhoto(request: Request, env: WorkerEnv, id: string) {
+  await ensureSchema(env);
   const row = await env.DB.prepare("SELECT object_key,content_type FROM photos WHERE id=?").bind(id).first<{ object_key: string; content_type: string }>();
   if (!row) return new Response("Not found", { status: 404, headers: corsHeaders(request, env) });
   const object = await env.BUCKET.get(row.object_key);

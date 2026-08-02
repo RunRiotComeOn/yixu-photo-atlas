@@ -22,9 +22,10 @@ After the Worker is deployed, add a repository variable named `VITE_API_BASE` wh
 1. In Cloudflare Dashboard, open **Workers & Pages → Create → Import a repository**.
 2. Select this repository and use `worker/wrangler.jsonc` as the Wrangler configuration.
 3. Allow Cloudflare to provision the declared D1 database and R2 bucket.
-4. Apply `worker/migrations/0001_initial.sql` to the new D1 database.
-5. Add a secret named `ADMIN_TOKEN` with a long private value.
-6. Deploy, then set the resulting Worker URL as GitHub's `VITE_API_BASE` repository variable.
+4. Add a secret named `ADMIN_TOKEN` with a long private value.
+5. Deploy, then set the resulting Worker URL as GitHub's `VITE_API_BASE` repository variable.
+
+The Worker initializes the D1 schema safely on first use; the migration file remains checked in for auditing and future schema changes.
 
 Never commit `ADMIN_TOKEN`, Cloudflare API tokens, or local `.dev.vars` files.
 
