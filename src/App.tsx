@@ -5,7 +5,7 @@ import type { FeatureCollection, Geometry } from "geojson";
 import type { GeometryCollection, Topology } from "topojson-specification";
 import worldData from "world-atlas/countries-110m.json";
 import QRCode from "qrcode";
-import { ArrowLeft, ArrowRight, Camera, Check, Copy, Crosshair, Info, KeyRound, Minus, Plus, RefreshCw, ScanLine, Upload, X } from "lucide-react";
+import { ArrowLeft, ArrowRight, Camera, Check, Copy, Crosshair, Info, KeyRound, Minus, Plus, RefreshCw, ScanLine, Trash2, Upload, X } from "lucide-react";
 import { apiFetch, apiReady, apiUrl } from "./api";
 import { demoPhotos } from "./demo";
 import MobileUploader from "./MobileUploader";
@@ -51,12 +51,22 @@ function AtlasMap({ places, onOpen }: { places: Place[]; onOpen: (place: Place) 
   </svg><div className="tools"><button onClick={() => zoom(view.scale * 1.3)} aria-label="Zoom in"><Plus /></button><button onClick={() => zoom(view.scale / 1.3)} aria-label="Zoom out"><Minus /></button><button onClick={() => setView({ scale: 1, x: 0, y: 0 })} aria-label="Reset map"><Crosshair /></button></div><div className="map-help">DRAG TO EXPLORE · SCROLL TO ZOOM</div></section>;
 }
 
-function Gallery({ place, close }: { place: Place; close: () => void }) {
+function Gallery({ place, close, onDelete }: { place: Place; close: () => void; onDelete: (photo: AtlasPhoto, adminToken: string) => Promise<void> }) {
   const [index, setIndex] = useState(0);
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const [deleteKey, setDeleteKey] = useState(sessionStorage.getItem("atlas-admin-token") ?? "");
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState("");
   const move = useCallback((delta: number) => setIndex((current) => (current + delta + place.photos.length) % place.photos.length), [place.photos.length]);
   const photo = place.photos[index];
   useEffect(() => { const listener = (event: KeyboardEvent) => { if (event.key === "Escape") close(); if (event.key === "ArrowLeft") move(-1); if (event.key === "ArrowRight") move(1); }; addEventListener("keydown", listener); return () => removeEventListener("keydown", listener); }, [close, move]);
-  return <div className="overlay" onMouseDown={close}><div className="gallery" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}><button className="close" onClick={close}><X /></button><header><div><small>PLACE {String(place.photos.length).padStart(2, "0")}</small><h2>{place.city}</h2><i>{place.country}</i></div><span>{index + 1} / {place.photos.length}</span></header><div className="stage"><img src={photo.src} alt={photo.caption ?? photo.filename} />{place.photos.length > 1 && <><button className="prev" onClick={() => move(-1)}><ArrowLeft /></button><button className="next" onClick={() => move(1)}><ArrowRight /></button></>}</div><footer><i>{photo.caption ?? photo.filename}</i><span>{photo.latitude.toFixed(3)}°, {photo.longitude.toFixed(3)}°</span></footer></div></div>;
+  const confirmDelete = async () => {
+    if (!deleteKey.trim()) { setDeleteError("Enter your private upload key."); return; }
+    setDeleting(true); setDeleteError("");
+    try { await onDelete(photo, deleteKey.trim()); }
+    catch (cause) { setDeleteError(cause instanceof Error ? cause.message : "Could not delete photograph"); setDeleting(false); }
+  };
+  return <div className="overlay" onMouseDown={close}><div className="gallery" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}><button className="close" onClick={close}><X /></button><header><div><small>PLACE {String(place.photos.length).padStart(2, "0")}</small><h2>{place.city}</h2><i>{place.country}</i></div><span>{index + 1} / {place.photos.length}</span></header><div className="stage"><img src={photo.src} alt={photo.caption ?? photo.filename} />{place.photos.length > 1 && <><button className="prev" onClick={() => move(-1)}><ArrowLeft /></button><button className="next" onClick={() => move(1)}><ArrowRight /></button></>}</div><footer><i>{photo.caption ?? photo.filename}</i><div className="gallery-meta"><span>{photo.latitude.toFixed(3)}°, {photo.longitude.toFixed(3)}°</span><button className="delete-photo" onClick={() => { setDeleteOpen(true); setDeleteError(""); }}><Trash2 />Delete</button></div></footer>{deleteOpen && <div className="delete-confirm" role="alertdialog" aria-label="Delete photograph"><div><small>DELETE PHOTOGRAPH</small><h3>This removes the image permanently.</h3><p>The original file in R2 and its map record in D1 will both be deleted.</p><label>Private upload key<input type="password" value={deleteKey} onChange={(event) => setDeleteKey(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void confirmDelete(); }} autoFocus /></label>{deleteError && <p className="delete-error">{deleteError}</p>}<div className="delete-actions"><button onClick={() => setDeleteOpen(false)} disabled={deleting}>Cancel</button><button className="danger" onClick={() => void confirmDelete()} disabled={deleting}>{deleting ? <RefreshCw className="spin" /> : <Trash2 />}{deleting ? "Deleting…" : "Delete permanently"}</button></div></div></div>}</div></div>;
 }
 
 function QRPanel({ close }: { close: () => void }) {
@@ -95,8 +105,16 @@ export default function App() {
   const [panel, setPanel] = useState<"qr" | "about" | null>(null);
 
   useEffect(() => { if (!apiReady || uploadToken) return; apiFetch("/api/photos").then(async (response) => { if (!response.ok) return; const body = await response.json() as { photos: AtlasPhoto[] }; if (body.photos.length) { setPhotos(body.photos.map((photo) => ({ ...photo, src: photo.src.startsWith("http") ? photo.src : apiUrl(photo.src) }))); setDemo(false); } }).catch(() => undefined); }, [uploadToken]);
+  const deletePhoto = async (photo: AtlasPhoto, adminToken: string) => {
+    const response = await apiFetch(`/api/photos/${encodeURIComponent(photo.id)}`, { method: "DELETE", headers: { Authorization: `Bearer ${adminToken}` } });
+    const body = await response.json() as { error?: string };
+    if (!response.ok) throw new Error(body.error ?? "Could not delete photograph");
+    sessionStorage.setItem("atlas-admin-token", adminToken);
+    setPhotos((current) => current.filter((item) => item.id !== photo.id));
+    setSelected(null);
+  };
   const places = useMemo(() => placesOf(photos), [photos]);
   if (uploadToken) return <MobileUploader token={uploadToken} />;
 
-  return <main className="atlas"><header className="top"><div className="brand"><small>ARCHIVE № 01</small><h1>Yixu’s Atlas</h1><p>A personal geography of light</p></div><div className="actions"><nav><button onClick={() => setPanel("qr")}><ScanLine />Scan to add</button><button onClick={() => setPanel("about")}>About</button></nav><span>{places.length} places · {photos.length} photographs</span></div></header><AtlasMap places={places} onOpen={setSelected} />{demo && <div className="sample"><b>{apiReady ? "Sample atlas" : "Backend setup pending"}</b> · {apiReady ? "Scan to add your photographs" : "Deploy Cloudflare to connect uploads"}</div>}<button className="mobile-add" onClick={() => setPanel("qr")}><Upload />Add photographs</button>{selected && <Gallery place={selected} close={() => setSelected(null)} />}{panel === "qr" && <QRPanel close={() => setPanel(null)} />}{panel === "about" && <div className="overlay" onMouseDown={() => setPanel(null)}><aside className="panel about" onMouseDown={(event) => event.stopPropagation()}><button className="close" onClick={() => setPanel(null)}><X /></button><small>ABOUT THE ATLAS</small><h2>A personal<br />geography of light.</h2><p>Yixu’s Atlas turns photographs into a map of lived moments. Location is read from each image, so the archive grows according to where the camera has actually been.</p><hr /><dl><div><dt>Navigate</dt><dd>Drag, zoom, hover</dd></div><div><dt>Open</dt><dd>Select a blue marker</dd></div><div><dt>Add</dt><dd>Scan from an iPhone</dd></div></dl></aside></div>}</main>;
+  return <main className="atlas"><header className="top"><div className="brand"><small>ARCHIVE № 01</small><h1>Yixu’s Atlas</h1><p>A personal geography of light</p></div><div className="actions"><nav><button onClick={() => setPanel("qr")}><ScanLine />Scan to add</button><button onClick={() => setPanel("about")}>About</button></nav><span>{places.length} places · {photos.length} photographs</span></div></header><AtlasMap places={places} onOpen={setSelected} />{demo && <div className="sample"><b>{apiReady ? "Sample atlas" : "Backend setup pending"}</b> · {apiReady ? "Scan to add your photographs" : "Deploy Cloudflare to connect uploads"}</div>}<button className="mobile-add" onClick={() => setPanel("qr")}><Upload />Add photographs</button>{selected && <Gallery place={selected} close={() => setSelected(null)} onDelete={deletePhoto} />}{panel === "qr" && <QRPanel close={() => setPanel(null)} />}{panel === "about" && <div className="overlay" onMouseDown={() => setPanel(null)}><aside className="panel about" onMouseDown={(event) => event.stopPropagation()}><button className="close" onClick={() => setPanel(null)}><X /></button><small>ABOUT THE ATLAS</small><h2>A personal<br />geography of light.</h2><p>Yixu’s Atlas turns photographs into a map of lived moments. Location is read from each image, so the archive grows according to where the camera has actually been.</p><hr /><dl><div><dt>Navigate</dt><dd>Drag, zoom, hover</dd></div><div><dt>Open</dt><dd>Select a blue marker</dd></div><div><dt>Add</dt><dd>Scan from an iPhone</dd></div></dl></aside></div>}</main>;
 }
